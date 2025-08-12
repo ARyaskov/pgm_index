@@ -1,0 +1,22 @@
+[build]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+popcnt,+lzcnt",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+popcnt,+lzcnt,+sse4.2",
+    "-C", "link-arg=-Wl,--gc-sections",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+popcnt,+lzcnt,+sse4.2",
+]
+
+[alias]
+bench-all = "bench --all-features"
+example = "run --example simple_benchmark --release"
