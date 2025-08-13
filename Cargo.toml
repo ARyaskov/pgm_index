@@ -1,6 +1,6 @@
 [package]
 name = "pgm_index"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Ultra-fast learned PGM-Index for efficient sorted key lookup with bounded error"
 license = "MIT"
