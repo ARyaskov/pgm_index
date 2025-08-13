@@ -1,8 +1,8 @@
 //! Criterion benchmark comparing PGM-Index vs binary search
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use pgm_index::PGMIndex;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 fn bench_single_lookups(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_lookups");

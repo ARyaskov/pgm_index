@@ -17,6 +17,11 @@ rustflags = [
     "-C", "target-feature=+avx2,+fma,+bmi2,+popcnt,+lzcnt,+sse4.2",
 ]
 
+[target.aarch64-apple-darwin]
+rustflags = [
+#    "-C", "target-cpu=native" # if you'll enable "native" for aarch64, lookup on M1 will be x2-3 longer 🤷
+]
+
 [alias]
 bench-all = "bench --all-features"
 example = "run --example simple_benchmark --release"

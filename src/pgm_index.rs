@@ -4,21 +4,24 @@
 //! with SIMD optimizations and parallel processing.
 
 // Use fast allocator on Unix systems
-#[cfg(not(target_env = "msvc"))]
+#[cfg(feature = "jemalloc")]
 use jemallocator::Jemalloc;
-#[cfg(not(target_env = "msvc"))]
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // SIMD support for x86_64
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+const FP_SHIFT: u32 = 32; // Q32 fixed-point shift
+const FP_ONE: i64 = 1i64 << FP_SHIFT; // 1.0 in Q32
 
 /// A key that can be used in PGM-Index.
 /// Must be orderable and convertible to f64 for linear regression.
@@ -37,6 +40,9 @@ impl Key for i16 {}
 pub struct Segment<K: Key> {
     slope: f64,
     intercept: f64,
+    // Cached fixed-point (Q32) parameters for hot path (pos = slope*x + intercept)
+    slope_q32: i64,     // slope * 2^32
+    intercept_q32: i64, // intercept * 2^32
     min_key: K,
     max_key: K,
     start_pos: usize,
@@ -327,6 +333,8 @@ impl<K: Key> PGMIndex<K> {
             return Segment {
                 slope: 0.0,
                 intercept: start as f64,
+                slope_q32: 0,
+                intercept_q32: (start as i64) << FP_SHIFT,
                 min_key: data[start],
                 max_key: data[start],
                 start_pos: start,
@@ -413,9 +421,14 @@ impl<K: Key> PGMIndex<K> {
         };
         let intercept = (sum_y - slope * sum_x) / n_f;
 
+        let slope_q32 = (slope * (1u128 << FP_SHIFT) as f64).round() as i64;
+        let intercept_q32 = (intercept * (1u128 << FP_SHIFT) as f64).round() as i64;
+
         Segment {
             slope,
             intercept,
+            slope_q32,
+            intercept_q32,
             min_key: data[start],
             max_key: data[end - 1],
             start_pos: start,
@@ -520,14 +533,15 @@ impl<K: Key> PGMIndex<K> {
         let seg_idx = self.find_segment_fast(key);
         let seg = &self.segments[seg_idx];
 
-        let key_f64 = key.to_f64().unwrap();
-        let predicted_pos = seg.slope.mul_add(key_f64, seg.intercept);
+        // Fixed-point (Q32) estimate: pos ≈ slope*key + intercept
+        let key_i128 = key.to_f64().unwrap() as i128; // keys are integers representable in f64
+        let pos_i64 = (((key_i128 * (seg.slope_q32 as i128)) + (seg.intercept_q32 as i128))
+            >> FP_SHIFT) as i64;
 
-        let segment_start = seg.start_pos as f64;
-        let segment_end = seg.end_pos as f64;
-        let clamped_pos = predicted_pos.max(segment_start).min(segment_end - 1.0);
-
-        let mid = clamped_pos.round() as isize;
+        // Clamp to this segment's range [start_pos, end_pos-1]
+        let seg_lo = seg.start_pos as i64;
+        let seg_hi = (seg.end_pos as i64) - 1;
+        let mid = pos_i64.clamp(seg_lo, seg_hi) as isize;
         let epsilon_i = self.epsilon as isize;
 
         let lo = (mid - epsilon_i).max(0) as usize;

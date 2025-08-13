@@ -4,7 +4,7 @@
 //! the performance of PGM-Index against standard binary search.
 
 use pgm_index::PGMIndex;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::time::Instant;
 
 fn main() {
