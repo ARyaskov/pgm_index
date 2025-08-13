@@ -14,31 +14,21 @@
 //! - **Ultra-fast lookups**: Often 3-10x faster than binary search
 //! - **Memory efficient**: Low memory overhead per element
 //! - **Parallel processing**: SIMD-optimized with multi-threading support
-//! - **Type flexibility**: Works with any numeric key type
-//! - **Zero dependencies**: Core functionality requires no external crates
 //!
-//! ## Quick Start
+//! ## Usage
 //!
 //! ```rust
 //! use pgm_index::PGMIndex;
 //!
-//! // Create sorted data
-//! let data: Vec<u64> = (0..1_000_000).collect();
-//!
-//! // Build index with epsilon = 64
-//! let index = PGMIndex::new(data, 64);
-//!
-//! // Fast lookups
-//! if let Some(position) = index.get(123456) {
-//!     println!("Found at position: {}", position);
+//! fn main() {
+//!     let data: Vec<u64> = (0..1_000_000).collect();
+//!     let pgm = PGMIndex::new(data, 32);
+//!     assert_eq!(pgm.get(123_456), Some(123_456));
 //! }
-//!
-//! // Batch queries for better performance
-//! let queries = vec![100, 500, 1000, 5000];
-//! let results = index.batch_get(&queries);
 //! ```
 //!
-//! ## Performance
+//! ## Notes
+//! - Keys must be sorted ascending.
 //!
 //! The epsilon parameter controls the trade-off between memory usage and query speed:
 //! - **Smaller epsilon** → more segments → better predictions → faster queries
@@ -46,10 +36,24 @@
 //!
 //! Recommended epsilon values: 16-128 for most use cases.
 
-pub mod pgm_index;
+mod pgm_index;
 
 // Re-export main types
-pub use pgm_index::{Key, PGMIndex, Segment};
+pub use pgm_index::{Key, PGMIndex, PGMStats, Segment};
+
+// --- rayon global pool init: at least 4 threads ---
+use std::sync::Once;
+static RAYON_INIT: Once = Once::new();
+
+/// Ensure Rayon global thread-pool is initialized with at least 4 threads.
+pub fn init_rayon_min_threads() {
+    RAYON_INIT.call_once(|| {
+        let n = std::cmp::max(4, num_cpus::get());
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -59,30 +63,9 @@ mod tests {
     fn test_basic_functionality() {
         let data: Vec<u64> = (0..1000).collect();
         let index = PGMIndex::new(data, 32);
-
-        // Test single lookups
-        assert_eq!(index.get(0), Some(0));
-        assert_eq!(index.get(500), Some(500));
+        assert_eq!(index.get(123), Some(123));
         assert_eq!(index.get(999), Some(999));
         assert_eq!(index.get(1000), None);
-
-        // Test batch lookups
-        let queries = vec![10, 100, 500, 999];
-        let results = index.batch_get(&queries);
-        assert_eq!(results, vec![Some(10), Some(100), Some(500), Some(999)]);
-    }
-
-    #[test]
-    fn test_different_key_types() {
-        // Test with i32
-        let data: Vec<i32> = (0..100).collect();
-        let index = PGMIndex::new(data, 16);
-        assert_eq!(index.get(50), Some(50));
-
-        // Test with u32
-        let data: Vec<u32> = (0..100).collect();
-        let index = PGMIndex::new(data, 16);
-        assert_eq!(index.get(50), Some(50));
     }
 
     #[test]

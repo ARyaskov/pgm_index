@@ -5,10 +5,14 @@
 
 use pgm_index::PGMIndex;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use rayon::prelude::*;
 use std::time::Instant;
 
 fn main() {
     println!("=== PGM-Index Simple Benchmark ===\n");
+    // Initialize Rayon global pool with at least 4 threads
+    pgm_index::init_rayon_min_threads();
+    println!("Rayon threads: {}", rayon::current_num_threads());
 
     const N: usize = 1_000_000_000;
     const QUERY_COUNT: usize = 100_000;
@@ -62,7 +66,7 @@ fn test_epsilon(epsilon: usize, data: &[u64], queries: &[u64]) {
     let single_time = single_start.elapsed();
     println!("Single query time ({} hits / 10): {:?}", hits, single_time);
 
-    // Batch throughput
+    // Batch throughput (sequential)
     let batch_start = Instant::now();
     let mut hits = 0usize;
     for &q in queries {
@@ -79,6 +83,22 @@ fn test_epsilon(epsilon: usize, data: &[u64], queries: &[u64]) {
     );
     println!("Batch average: {:.1} ns/query", ns_per_query);
     println!("Hits: {}/{}", hits, queries.len());
+
+    // Parallel batch throughput (rayon)
+    let par_start = Instant::now();
+    let par_hits = queries
+        .par_iter()
+        .filter(|&&q| index.get(q).is_some())
+        .count();
+    let par_time = par_start.elapsed();
+    let par_ns_per_query = par_time.as_nanos() as f64 / (queries.len() as f64);
+    println!("Parallel batch time: {:?}", par_time);
+    println!(
+        "Parallel throughput: {:.0} queries/sec",
+        (queries.len() as f64) / par_time.as_secs_f64()
+    );
+    println!("Parallel average: {:.1} ns/query", par_ns_per_query);
+    println!("Parallel hits: {}/{}", par_hits, queries.len());
 
     // Edge keys
     let test_keys = vec![data[0], data[data.len() / 2], data[data.len() - 1]];

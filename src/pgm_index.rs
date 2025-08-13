@@ -43,6 +43,7 @@ pub struct Segment<K: Key> {
     pub end_idx: Idx,
 }
 
+/// Lightweight stats for export
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default)]
 pub struct PGMStats {
@@ -81,16 +82,19 @@ impl<K: Key> PGMIndex<K> {
         assert!(!data.is_empty(), "data must not be empty");
         assert!(is_sorted(&data), "data must be sorted");
 
-        let data = Arc::new(data);
-        let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+        // Ensure global Rayon pool with at least 4 threads
+        crate::init_rayon_min_threads();
 
-        let (segments, segment_lookup, lookup_scale, min_key_f64) = pool.install(|| {
+        let data = Arc::new(data);
+
+        // Use global Rayon pool for parallel iterators
+        let (segments, segment_lookup, lookup_scale, min_key_f64) = {
             let target_segments = Self::optimal_segment_count_adaptive(&data, epsilon);
             let segments = Self::build_segments_parallel(&data, target_segments);
             let (segment_lookup, lookup_scale, min_key_f64) =
                 Self::build_lookup_table(&data, &segments);
             (segments, segment_lookup, lookup_scale, min_key_f64)
-        });
+        };
 
         Self {
             epsilon,
@@ -323,6 +327,22 @@ impl<K: Key> PGMIndex<K> {
             Ok(pos) => Some(start + pos),
             Err(_) => None,
         }
+    }
+
+    /// Parallel batch lookup: returns positions for each key (None if absent).
+    pub fn get_many_parallel(&self, keys: &[K]) -> Vec<Option<usize>>
+    where
+        K: Sync,
+    {
+        keys.par_iter().map(|&k| self.get(k)).collect()
+    }
+
+    /// Parallel batch hit count (useful for throughput microbenchmarks).
+    pub fn count_hits_parallel(&self, keys: &[K]) -> usize
+    where
+        K: Sync,
+    {
+        keys.par_iter().filter(|&&k| self.get(k).is_some()).count()
     }
 }
 
