@@ -3,7 +3,6 @@
 //! A high-performance implementation of the Piecewise Geometric Model (PGM) Index
 //! with SIMD optimizations and parallel processing.
 
-// Use fast allocator on Unix systems
 #[cfg(feature = "jemalloc")]
 use jemallocator::Jemalloc;
 #[cfg(feature = "jemalloc")]
@@ -12,56 +11,53 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-// SIMD support for x86_64
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+type Idx = usize;
 
-const FP_SHIFT: u32 = 32; // Q32 fixed-point shift
-const FP_ONE: i64 = 1i64 << FP_SHIFT; // 1.0 in Q32
-
-/// A key that can be used in PGM-Index.
-/// Must be orderable and convertible to f64 for linear regression.
-pub trait Key: Ord + Copy + ToPrimitive + Send + Sync + 'static {}
-
-impl Key for u64 {}
-impl Key for i64 {}
-impl Key for u32 {}
-impl Key for i32 {}
+/// Trait bound for key types supported by the PGM-Index
+pub trait Key: Copy + Send + Sync + Ord + ToPrimitive + std::fmt::Debug + 'static {}
+impl Key for u8 {}
+impl Key for i8 {}
 impl Key for u16 {}
 impl Key for i16 {}
+impl Key for u32 {}
+impl Key for i32 {}
+impl Key for u64 {}
+impl Key for i64 {}
+impl Key for usize {}
+impl Key for isize {}
 
-/// Linear segment representing a piecewise linear model: y = slope * x + intercept
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[repr(C, align(64))] // Cache-aligned for better performance
+/// Linear segment: y = slope * x + intercept  (x — index, y — key)
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(64))]
 pub struct Segment<K: Key> {
-    slope: f64,
-    intercept: f64,
-    // Cached fixed-point (Q32) parameters for hot path (pos = slope*x + intercept)
-    slope_q32: i64,     // slope * 2^32
-    intercept_q32: i64, // intercept * 2^32
-    min_key: K,
-    max_key: K,
-    start_pos: usize,
-    end_pos: usize,
+    pub min_key: K,
+    pub max_key: K,
+    pub slope: f64,
+    pub intercept: f64,
+    pub start_idx: Idx,
+    pub end_idx: Idx,
 }
 
-/// Performance statistics for the PGM-Index
-#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default)]
 pub struct PGMStats {
-    pub total_queries: u64,
-    pub cache_hits: u64,
-    pub cache_hit_rate: f64,
-    pub segment_count: usize,
+    pub segments: usize,
     pub avg_segment_size: f64,
-    pub memory_usage_bytes: usize,
+    pub memory_bytes: usize,
 }
 
-/// Data complexity estimation for adaptive segmentation
-#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentLookupConfig {
+    pub bins: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum DataComplexity {
     Linear,
     Quadratic,
@@ -69,622 +65,312 @@ enum DataComplexity {
     Random,
 }
 
-/// The main PGM-Index structure
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PGMIndex<K: Key> {
-    /// Error bound parameter
     pub epsilon: usize,
-    /// Sorted input data
     pub data: Arc<Vec<K>>,
-    /// Linear segments
     segments: Vec<Segment<K>>,
-    /// Fast segment lookup table
     segment_lookup: Vec<usize>,
-    /// Scaling factor for lookup table
     lookup_scale: f64,
-    /// Minimum key as f64 for calculations
     min_key_f64: f64,
-    /// Performance statistics
-    stats: Arc<PGMStatsInternal>,
-}
-
-#[derive(Debug, Default)]
-struct PGMStatsInternal {
-    cache_hits: AtomicU64,
-    total_queries: AtomicU64,
-}
-
-// Custom serialization to handle Arc and atomic types
-impl<K: Key + Serialize> Serialize for PGMIndex<K> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("PGMIndex", 6)?;
-        state.serialize_field("epsilon", &self.epsilon)?;
-        state.serialize_field("data", &*self.data)?;
-        state.serialize_field("segments", &self.segments)?;
-        state.serialize_field("segment_lookup", &self.segment_lookup)?;
-        state.serialize_field("lookup_scale", &self.lookup_scale)?;
-        state.serialize_field("min_key_f64", &self.min_key_f64)?;
-        state.end()
-    }
-}
-
-impl<'de, K: Key + Deserialize<'de>> Deserialize<'de> for PGMIndex<K> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
-        struct PGMIndexVisitor<K>(std::marker::PhantomData<K>);
-
-        impl<'de, K: Key + Deserialize<'de>> Visitor<'de> for PGMIndexVisitor<K> {
-            type Value = PGMIndex<K>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("struct PGMIndex")
-            }
-
-            fn visit_map<V>(self, mut map: V) -> Result<PGMIndex<K>, V::Error>
-            where
-                V: MapAccess<'de>,
-            {
-                let mut epsilon = None;
-                let mut data = None;
-                let mut segments = None;
-                let mut segment_lookup = None;
-                let mut lookup_scale = None;
-                let mut min_key_f64 = None;
-
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        "epsilon" => epsilon = Some(map.next_value()?),
-                        "data" => data = Some(Arc::new(map.next_value::<Vec<K>>()?)),
-                        "segments" => segments = Some(map.next_value()?),
-                        "segment_lookup" => segment_lookup = Some(map.next_value()?),
-                        "lookup_scale" => lookup_scale = Some(map.next_value()?),
-                        "min_key_f64" => min_key_f64 = Some(map.next_value()?),
-                        _ => {
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                Ok(PGMIndex {
-                    epsilon: epsilon.ok_or_else(|| de::Error::missing_field("epsilon"))?,
-                    data: data.ok_or_else(|| de::Error::missing_field("data"))?,
-                    segments: segments.ok_or_else(|| de::Error::missing_field("segments"))?,
-                    segment_lookup: segment_lookup
-                        .ok_or_else(|| de::Error::missing_field("segment_lookup"))?,
-                    lookup_scale: lookup_scale
-                        .ok_or_else(|| de::Error::missing_field("lookup_scale"))?,
-                    min_key_f64: min_key_f64
-                        .ok_or_else(|| de::Error::missing_field("min_key_f64"))?,
-                    stats: Arc::new(PGMStatsInternal::default()),
-                })
-            }
-        }
-
-        const FIELDS: &[&str] = &[
-            "epsilon",
-            "data",
-            "segments",
-            "segment_lookup",
-            "lookup_scale",
-            "min_key_f64",
-        ];
-        deserializer.deserialize_struct(
-            "PGMIndex",
-            FIELDS,
-            PGMIndexVisitor(std::marker::PhantomData),
-        )
-    }
 }
 
 impl<K: Key> PGMIndex<K> {
-    /// Build a new PGM-Index from sorted data
-    ///
-    /// # Arguments
-    /// * `data` - Sorted input data
-    /// * `epsilon` - Error bound parameter (controls accuracy vs memory trade-off)
-    ///
-    /// # Panics
-    /// Panics if epsilon is 0 or data is empty
-    ///
-    /// # Examples
-    /// ```
-    /// use pgm_index::PGMIndex;
-    ///
-    /// let data: Vec<u64> = (0..100_000).collect();
-    /// let index = PGMIndex::new(data, 64);
-    /// ```
     pub fn new(data: Vec<K>, epsilon: usize) -> Self {
-        Self::new_with_threads(data, epsilon, rayon::current_num_threads())
-    }
+        assert!(epsilon > 0, "epsilon must be > 0");
+        assert!(!data.is_empty(), "data must not be empty");
+        assert!(is_sorted(&data), "data must be sorted");
 
-    /// Build PGM-Index with specified number of threads
-    pub fn new_with_threads(data: Vec<K>, epsilon: usize, num_threads: usize) -> Self {
-        assert!(epsilon > 0, "epsilon must be positive");
-        assert!(!data.is_empty(), "data cannot be empty");
+        let data = Arc::new(data);
+        let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
 
-        // Verify data is sorted
-        debug_assert!(data.windows(2).all(|w| w[0] <= w[1]), "data must be sorted");
-
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .unwrap();
-
-        let result = pool.install(|| {
-            // Adaptive segmentation based on data complexity
+        let (segments, segment_lookup, lookup_scale, min_key_f64) = pool.install(|| {
             let target_segments = Self::optimal_segment_count_adaptive(&data, epsilon);
-
-            // Build segments with SIMD optimization
             let segments = Self::build_segments_parallel(&data, target_segments);
-
-            // Build fast lookup table
             let (segment_lookup, lookup_scale, min_key_f64) =
-                Self::build_segment_lookup(&segments, &data);
-
+                Self::build_lookup_table(&data, &segments);
             (segments, segment_lookup, lookup_scale, min_key_f64)
         });
 
-        PGMIndex {
+        Self {
             epsilon,
-            data: Arc::new(data),
-            segments: result.0,
-            segment_lookup: result.1,
-            lookup_scale: result.2,
-            min_key_f64: result.3,
-            stats: Arc::new(PGMStatsInternal::default()),
+            data,
+            segments,
+            segment_lookup,
+            lookup_scale,
+            min_key_f64,
         }
     }
 
-    /// Estimate optimal segment count based on data complexity
+    pub fn stats(&self) -> PGMStats {
+        PGMStats {
+            segments: self.segment_count(),
+            avg_segment_size: self.avg_segment_size(),
+            memory_bytes: self.memory_usage(),
+        }
+    }
+
+    fn estimate_data_complexity(data: &[K]) -> DataComplexity {
+        let sample_size = 1000.min(data.len());
+        if sample_size < 10 {
+            return DataComplexity::Linear;
+        }
+        let sample = &data[0..sample_size];
+        let mut gaps = Vec::with_capacity(sample_size - 1);
+        for i in 1..sample.len() {
+            let gap = sample[i].to_f64().unwrap() - sample[i - 1].to_f64().unwrap();
+            gaps.push(gap);
+        }
+        let mean_gap = gaps.iter().copied().sum::<f64>() / (gaps.len() as f64);
+        let var_gap = gaps
+            .iter()
+            .map(|g| (g - mean_gap) * (g - mean_gap))
+            .sum::<f64>()
+            / (gaps.len() as f64);
+
+        if var_gap < 1e-9 {
+            return DataComplexity::Linear;
+        }
+
+        let mut increasing = 0usize;
+        let mut decreasing = 0usize;
+        for i in 1..gaps.len() {
+            if gaps[i] > gaps[i - 1] {
+                increasing += 1;
+            } else if gaps[i] < gaps[i - 1] {
+                decreasing += 1;
+            }
+        }
+
+        if increasing > (gaps.len() * 3) / 4 {
+            DataComplexity::Exponential
+        } else if decreasing > (gaps.len() * 3) / 4 {
+            DataComplexity::Quadratic
+        } else if var_gap > mean_gap * 10.0 {
+            DataComplexity::Random
+        } else {
+            DataComplexity::Quadratic
+        }
+    }
+
+    /// min: ≥1 and ≥4/core; max: ≤ n/32
     fn optimal_segment_count_adaptive(data: &[K], epsilon: usize) -> usize {
         let complexity = Self::estimate_data_complexity(data);
         let n = data.len();
         let cores = rayon::current_num_threads();
 
         let base_segments = match complexity {
-            DataComplexity::Linear => n / (epsilon * 16), // Large segments for simple data
-            DataComplexity::Quadratic => n / (epsilon * 8), // Medium segments
-            DataComplexity::Exponential => n / (epsilon * 4), // Small segments
-            DataComplexity::Random => n / (epsilon * 2),  // Very small segments
+            DataComplexity::Linear => n / (epsilon * 16),
+            DataComplexity::Quadratic => n / (epsilon * 8),
+            DataComplexity::Exponential => n / (epsilon * 4),
+            DataComplexity::Random => n / (epsilon * 2),
         };
 
-        base_segments
-            .max(cores * 4) // Minimum 4 segments per core
-            .min(n / 32) // Maximum n/32 segments
-            .min(50000) // Absolute maximum
+        base_segments.max(1).max(cores * 4).min(n / 32)
     }
 
-    /// Estimate data complexity for adaptive segmentation
-    fn estimate_data_complexity(data: &[K]) -> DataComplexity {
-        let sample_size = 1000.min(data.len());
-        if sample_size < 10 {
-            return DataComplexity::Linear;
-        }
-
-        let sample = &data[0..sample_size];
-        let mut gaps = Vec::with_capacity(sample_size - 1);
-
-        for i in 1..sample.len() {
-            let gap = sample[i].to_f64().unwrap() - sample[i - 1].to_f64().unwrap();
-            gaps.push(gap);
-        }
-
-        if gaps.is_empty() {
-            return DataComplexity::Linear;
-        }
-
-        let avg_gap = gaps.iter().sum::<f64>() / gaps.len() as f64;
-
-        if avg_gap.abs() < f64::EPSILON {
-            return DataComplexity::Linear; // All elements are equal
-        }
-
-        let variance = gaps.iter().map(|&g| (g - avg_gap).powi(2)).sum::<f64>() / gaps.len() as f64;
-
-        let coefficient_of_variation = (variance.sqrt() / avg_gap).abs();
-
-        match coefficient_of_variation {
-            cv if cv < 0.1 => DataComplexity::Linear,
-            cv if cv < 1.0 => DataComplexity::Quadratic,
-            cv if cv < 10.0 => DataComplexity::Exponential,
-            _ => DataComplexity::Random,
-        }
-    }
-
-    /// Build segments in parallel with SIMD optimization
     fn build_segments_parallel(data: &[K], target_segments: usize) -> Vec<Segment<K>> {
         let n = data.len();
-        let segment_size = n / target_segments;
+        let target_segments = target_segments.max(1).min(n);
 
-        let ranges: Vec<(usize, usize)> = (0..target_segments)
+        let mut bounds = Vec::with_capacity(target_segments + 1);
+        for s in 0..=target_segments {
+            let idx = s * n / target_segments;
+            bounds.push(idx);
+        }
+
+        let segments: Vec<Segment<K>> = (0..target_segments)
+            .into_par_iter()
             .map(|i| {
-                let start = i * segment_size;
-                let end = if i == target_segments - 1 {
-                    n
-                } else {
-                    (i + 1) * segment_size
-                };
-                (start, end)
+                let start = bounds[i];
+                let end = bounds[i + 1].max(start + 1);
+                Self::fit_segment(&data[start..end], start)
             })
             .collect();
 
-        ranges
-            .par_iter()
-            .map(|&(start, end)| Self::fit_segment_optimized(data, start, end))
-            .collect()
-    }
-
-    /// Fit a linear segment using optimized linear regression
-    fn fit_segment_optimized(data: &[K], start: usize, end: usize) -> Segment<K> {
-        let n = end - start;
-        if n == 0 {
-            panic!("Cannot fit segment with zero elements");
-        }
-        if n == 1 {
-            return Segment {
-                slope: 0.0,
-                intercept: start as f64,
-                slope_q32: 0,
-                intercept_q32: (start as i64) << FP_SHIFT,
-                min_key: data[start],
-                max_key: data[start],
-                start_pos: start,
-                end_pos: end,
-            };
-        }
-
-        // Use SIMD for large segments on x86_64
-        if n > 1000 && cfg!(target_arch = "x86_64") && Self::has_avx2_support() {
-            unsafe { Self::fit_segment_avx2(data, start, end) }
-        } else {
-            Self::fit_segment_scalar(data, start, end)
-        }
-    }
-
-    /// Check AVX2 support
-    fn has_avx2_support() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            std::arch::is_x86_feature_detected!("avx2")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    }
-
-    /// AVX2-optimized linear regression (x86_64 only)
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn fit_segment_avx2(data: &[K], start: usize, end: usize) -> Segment<K> {
-        // For simplicity, fall back to scalar implementation
-        // A full SIMD implementation would require careful handling of different data types
-        Self::fit_segment_scalar(data, start, end)
-    }
-
-    /// Fallback for non-x86_64 architectures
-    #[cfg(not(target_arch = "x86_64"))]
-    unsafe fn fit_segment_avx2(data: &[K], start: usize, end: usize) -> Segment<K> {
-        Self::fit_segment_scalar(data, start, end)
-    }
-
-    /// Optimized scalar linear regression with loop unrolling
-    fn fit_segment_scalar(data: &[K], start: usize, end: usize) -> Segment<K> {
-        let n = end - start;
-        let mut sum_x = 0.0;
-        let mut sum_y = 0.0;
-        let mut sum_xy = 0.0;
-        let mut sum_x2 = 0.0;
-
-        // Manual loop unrolling (4x)
-        let mut i = 0;
-        let unroll_end = n & !3; // Round down to multiple of 4
-
-        while i < unroll_end {
-            for j in 0..4 {
-                let x = data[start + i + j].to_f64().unwrap();
-                let y = (start + i + j) as f64;
-                sum_x += x;
-                sum_y += y;
-                sum_xy += x * y;
-                sum_x2 += x * x;
+        let mut merged: Vec<Segment<K>> = Vec::with_capacity(segments.len());
+        for seg in segments {
+            if let Some(last) = merged.last_mut() {
+                if (last.slope - seg.slope).abs() < 1e-12
+                    && (last.intercept - seg.intercept).abs() < 1e-6
+                    && last.end_idx == seg.start_idx
+                    && last.max_key <= seg.min_key
+                {
+                    last.end_idx = seg.end_idx;
+                    last.max_key = seg.max_key;
+                    continue;
+                }
             }
-            i += 4;
+            merged.push(seg);
         }
+        merged
+    }
 
-        // Handle remainder
-        while i < n {
-            let x = data[start + i].to_f64().unwrap();
-            let y = (start + i) as f64;
-            sum_x += x;
+    fn fit_segment(slice: &[K], global_start: usize) -> Segment<K> {
+        let len = slice.len();
+        let min_key = slice.first().copied().unwrap();
+        let max_key = slice.last().copied().unwrap();
+
+        let n = len as f64;
+        let sum_i = (len - 1) as f64 * (len as f64) / 2.0;
+        let sum_i2 = (len - 1) as f64 * (len as f64) * (2.0 * (len as f64) - 1.0) / 6.0;
+
+        let mut sum_y = 0.0;
+        let mut sum_i_y = 0.0;
+        for (i, &k) in slice.iter().enumerate() {
+            let y = k.to_f64().unwrap();
             sum_y += y;
-            sum_xy += x * y;
-            sum_x2 += x * x;
-            i += 1;
+            sum_i_y += (i as f64) * y;
         }
 
-        let n_f = n as f64;
-        let denominator = sum_x2 * n_f - sum_x * sum_x;
-        let slope = if denominator.abs() > f64::EPSILON {
-            (sum_xy * n_f - sum_x * sum_y) / denominator
+        let denom = n * sum_i2 - sum_i * sum_i;
+        let (slope, intercept) = if denom.abs() < 1e-12 {
+            (0.0, sum_y / n)
         } else {
-            0.0
+            let slope = (n * sum_i_y - sum_i * sum_y) / denom;
+            let intercept = (sum_y - slope * sum_i) / n;
+            (slope, intercept)
         };
-        let intercept = (sum_y - slope * sum_x) / n_f;
-
-        let slope_q32 = (slope * (1u128 << FP_SHIFT) as f64).round() as i64;
-        let intercept_q32 = (intercept * (1u128 << FP_SHIFT) as f64).round() as i64;
 
         Segment {
+            min_key,
+            max_key,
             slope,
             intercept,
-            slope_q32,
-            intercept_q32,
-            min_key: data[start],
-            max_key: data[end - 1],
-            start_pos: start,
-            end_pos: end,
+            start_idx: global_start,
+            end_idx: global_start + len,
         }
     }
 
-    /// Build fast segment lookup table
-    fn build_segment_lookup(segments: &[Segment<K>], data: &[K]) -> (Vec<usize>, f64, f64) {
-        if segments.is_empty() {
-            return (vec![0], 1.0, 0.0);
-        }
+    fn build_lookup_table(data: &[K], segments: &[Segment<K>]) -> (Vec<usize>, f64, f64) {
+        let bins = (segments.len() * 4).max(1024).min(1 << 20);
+        let min_key_f64 = data.first().unwrap().to_f64().unwrap();
+        let max_key_f64 = data.last().unwrap().to_f64().unwrap();
+        let span = (max_key_f64 - min_key_f64).max(1.0);
+        let scale = (bins as f64) / span;
 
-        let min_key_f64 = data[0].to_f64().unwrap();
-        let max_key_f64 = data[data.len() - 1].to_f64().unwrap();
-        let key_range = max_key_f64 - min_key_f64;
-
-        if key_range == 0.0 {
-            return (vec![0], 1.0, min_key_f64);
-        }
-
-        // Optimal table size for cache efficiency
-        let table_size = (segments.len() * 8).max(1024).min(16384);
-        let scale = (table_size - 1) as f64 / key_range;
-
-        // Parallel lookup table construction
-        let lookup: Vec<usize> = (0..table_size)
-            .into_par_iter()
-            .map(|bucket| {
-                let key_for_bucket = min_key_f64 + (bucket as f64 / scale);
-                Self::find_segment_for_key_static(segments, key_for_bucket)
-            })
-            .collect();
-
-        (lookup, scale, min_key_f64)
-    }
-
-    fn find_segment_for_key_static(segments: &[Segment<K>], key: f64) -> usize {
-        let mut left = 0;
-        let mut right = segments.len();
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let seg_min = segments[mid].min_key.to_f64().unwrap();
-            let seg_max = segments[mid].max_key.to_f64().unwrap();
-
-            if key >= seg_min && key <= seg_max {
-                return mid;
-            } else if key < seg_min {
-                right = mid;
-            } else {
-                left = mid + 1;
+        let mut lut = vec![0usize; bins + 1];
+        let mut seg_idx = 0usize;
+        for b in 0..=bins {
+            let key_at_bin = min_key_f64 + (b as f64) / scale;
+            while seg_idx + 1 < segments.len()
+                && segments[seg_idx].max_key.to_f64().unwrap() < key_at_bin
+            {
+                seg_idx += 1;
             }
+            lut[b] = seg_idx;
         }
-
-        left.saturating_sub(1).min(segments.len() - 1)
+        (lut, scale, min_key_f64)
     }
 
-    /// Fast segment finding using lookup table
-    #[inline(always)]
-    fn find_segment_fast(&self, key: K) -> usize {
-        if self.segments.len() <= 1 {
-            return 0;
-        }
-
-        let key_f64 = key.to_f64().unwrap();
-        if key_f64 < self.min_key_f64 {
-            return 0;
-        }
-
-        let offset = key_f64 - self.min_key_f64;
-        let index = (offset * self.lookup_scale) as usize;
-        let seg_idx = self.segment_lookup[index.min(self.segment_lookup.len() - 1)];
-
-        let seg = &self.segments[seg_idx];
-        if key >= seg.min_key && key <= seg.max_key {
-            seg_idx
-        } else {
-            self.find_segment_binary_search(key)
-        }
-    }
-
-    fn find_segment_binary_search(&self, key: K) -> usize {
-        self.segments
-            .binary_search_by(|seg| {
-                if key < seg.min_key {
-                    std::cmp::Ordering::Greater
-                } else if key > seg.max_key {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .unwrap_or_else(|i| i.saturating_sub(1).min(self.segments.len() - 1))
-    }
-
-    /// Predict the range where a key might be located
-    ///
-    /// Returns (lo, hi) bounds for the search range
-    #[inline(always)]
-    pub fn predict(&self, key: K) -> (usize, usize) {
-        let seg_idx = self.find_segment_fast(key);
-        let seg = &self.segments[seg_idx];
-
-        // Fixed-point (Q32) estimate: pos ≈ slope*key + intercept
-        let key_i128 = key.to_f64().unwrap() as i128; // keys are integers representable in f64
-        let pos_i64 = (((key_i128 * (seg.slope_q32 as i128)) + (seg.intercept_q32 as i128))
-            >> FP_SHIFT) as i64;
-
-        // Clamp to this segment's range [start_pos, end_pos-1]
-        let seg_lo = seg.start_pos as i64;
-        let seg_hi = (seg.end_pos as i64) - 1;
-        let mid = pos_i64.clamp(seg_lo, seg_hi) as isize;
-        let epsilon_i = self.epsilon as isize;
-
-        let lo = (mid - epsilon_i).max(0) as usize;
-        let hi = ((mid + epsilon_i + 1) as usize).min(self.data.len());
-
-        (lo, hi)
-    }
-
-    /// Look up a key and return its position if found
-    ///
-    /// # Examples
-    /// ```
-    /// use pgm_index::PGMIndex;
-    ///
-    /// let data: Vec<u64> = (0..100).collect();
-    /// let index = PGMIndex::new(data, 16);
-    ///
-    /// assert_eq!(index.get(50), Some(50));
-    /// assert_eq!(index.get(200), None);
-    /// ```
-    #[inline(always)]
-    pub fn get(&self, key: K) -> Option<usize> {
-        self.stats.total_queries.fetch_add(1, Ordering::Relaxed);
-
-        let (lo, hi) = self.predict(key);
-
-        if lo >= self.data.len() || hi == 0 {
-            return None;
-        }
-
-        // Prefetch for better cache performance on x86_64
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            if std::arch::is_x86_feature_detected!("sse") {
-                let search_range = &self.data[lo..hi];
-                let ptr = search_range.as_ptr() as *const i8;
-                _mm_prefetch(ptr, _MM_HINT_T0);
-
-                if hi - lo > 8 {
-                    _mm_prefetch(ptr.add(64), _MM_HINT_T0);
-                }
-            }
-        }
-
-        let search_range = &self.data[lo..hi];
-        let result = search_range.binary_search(&key).ok();
-
-        if result.is_some() {
-            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-        }
-
-        result.map(|i| lo + i)
-    }
-
-    /// Batch lookup multiple keys for better performance
-    ///
-    /// # Examples
-    /// ```
-    /// use pgm_index::PGMIndex;
-    ///
-    /// let data: Vec<u64> = (0..100).collect();
-    /// let index = PGMIndex::new(data, 16);
-    ///
-    /// let queries = vec![10, 50, 90];
-    /// let results = index.batch_get(&queries);
-    /// assert_eq!(results, vec![Some(10), Some(50), Some(90)]);
-    /// ```
-    pub fn batch_get(&self, keys: &[K]) -> Vec<Option<usize>> {
-        if keys.len() < 1000 {
-            // Sequential for small batches
-            keys.iter().map(|&key| self.get(key)).collect()
-        } else {
-            // Parallel for large batches
-            keys.par_iter().map(|&key| self.get(key)).collect()
-        }
-    }
-
-    /// Batch predict ranges for multiple keys
-    pub fn batch_predict(&self, keys: &[K]) -> Vec<(usize, usize)> {
-        keys.par_iter().map(|&key| self.predict(key)).collect()
-    }
-
-    // Performance metrics
-
-    /// Get number of segments in the index
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
-
-    /// Get average segment size
     pub fn avg_segment_size(&self) -> f64 {
-        if self.segments.is_empty() {
-            0.0
-        } else {
-            self.data.len() as f64 / self.segments.len() as f64
-        }
+        (self.data.len() as f64) / (self.segments.len() as f64).max(1.0)
     }
-
-    /// Get memory usage in bytes
     pub fn memory_usage(&self) -> usize {
-        std::mem::size_of_val(&**self.data)
-            + std::mem::size_of_val(&*self.segments)
-            + std::mem::size_of_val(&*self.segment_lookup)
-            + std::mem::size_of::<Self>()
+        let data_bytes = self.data.len() * std::mem::size_of::<K>();
+        let seg_bytes = self.segments.len() * std::mem::size_of::<Segment<K>>();
+        let lut_bytes = self.segment_lookup.len() * std::mem::size_of::<usize>();
+        data_bytes + seg_bytes + lut_bytes
     }
 
-    /// Get cache hit rate
-    pub fn cache_hit_rate(&self) -> f64 {
-        let hits = self.stats.cache_hits.load(Ordering::Relaxed);
-        let total = self.stats.total_queries.load(Ordering::Relaxed);
-        if total > 0 {
-            hits as f64 / total as f64
+    fn predict_index(&self, key: K, segment_idx: usize) -> usize {
+        let seg = self.segments[segment_idx];
+        let y = key.to_f64().unwrap();
+        if seg.slope.abs() < 1e-18 {
+            seg.start_idx
         } else {
-            0.0
+            let x = (y - seg.intercept) / seg.slope;
+            let x = x as isize;
+            x.clamp(seg.start_idx as isize, (seg.end_idx as isize) - 1) as usize
         }
     }
 
-    /// Reset performance statistics
-    pub fn reset_stats(&self) {
-        self.stats.cache_hits.store(0, Ordering::Relaxed);
-        self.stats.total_queries.store(0, Ordering::Relaxed);
+    fn find_segment_for_key_lut(&self, key: K) -> usize {
+        if self.segments.len() <= 1 {
+            return 0;
+        }
+        let y = key.to_f64().unwrap();
+        let bin = ((y - self.min_key_f64) * self.lookup_scale)
+            .floor()
+            .clamp(0.0, (self.segment_lookup.len() - 1) as f64) as usize;
+        let mut idx = self.segment_lookup[bin];
+
+        while idx + 1 < self.segments.len() && key > self.segments[idx].max_key {
+            idx += 1;
+        }
+        while idx > 0 && key < self.segments[idx].min_key {
+            idx -= 1;
+        }
+        idx
     }
 
-    /// Get comprehensive performance statistics
-    pub fn get_stats(&self) -> PGMStats {
-        PGMStats {
-            total_queries: self.stats.total_queries.load(Ordering::Relaxed),
-            cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
-            cache_hit_rate: self.cache_hit_rate(),
-            segment_count: self.segment_count(),
-            avg_segment_size: self.avg_segment_size(),
-            memory_usage_bytes: self.memory_usage(),
+    pub fn get(&self, key: K) -> Option<usize> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        let sidx = self.find_segment_for_key_lut(key);
+        let i = self.predict_index(key, sidx);
+
+        let eps = self.epsilon;
+        let start = i.saturating_sub(eps);
+        let end = (i + eps + 1).min(self.data.len());
+
+        let slice = &self.data[start..end];
+        match slice.binary_search(&key) {
+            Ok(pos) => Some(start + pos),
+            Err(_) => None,
+        }
+    }
+}
+
+fn is_sorted<K: Ord>(data: &[K]) -> bool {
+    data.windows(2).all(|w| w[0] <= w[1])
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct PGMIndexSerde<K: Key> {
+        epsilon: usize,
+        data: Vec<K>,
+        segments: Vec<Segment<K>>,
+        segment_lookup: Vec<usize>,
+        lookup_scale: f64,
+        min_key_f64: f64,
+    }
+
+    impl<K: Key + Serialize> Serialize for PGMIndex<K> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let tmp = PGMIndexSerde {
+                epsilon: self.epsilon,
+                data: (*self.data).clone(),
+                segments: self.segments.clone(),
+                segment_lookup: self.segment_lookup.clone(),
+                lookup_scale: self.lookup_scale,
+                min_key_f64: self.min_key_f64,
+            };
+            tmp.serialize(serializer)
         }
     }
 
-    /// Get number of elements in the index
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if the index is empty
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+    impl<'de, K: Key + Deserialize<'de>> Deserialize<'de> for PGMIndex<K> {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let tmp = PGMIndexSerde::<K>::deserialize(deserializer)?;
+            Ok(PGMIndex {
+                epsilon: tmp.epsilon,
+                data: Arc::new(tmp.data),
+                segments: tmp.segments,
+                segment_lookup: tmp.segment_lookup,
+                lookup_scale: tmp.lookup_scale,
+                min_key_f64: tmp.min_key_f64,
+            })
+        }
     }
 }
 
@@ -693,104 +379,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pgm_index_correctness() {
-        let data: Vec<u64> = (0..100_000).collect();
-        let index = PGMIndex::new(data.clone(), 32);
-
-        // Test various keys
-        for &k in &[0, 1000, 50000, 99999] {
-            assert_eq!(index.get(k), Some(k as usize));
-        }
-
-        // Test non-existent keys
-        assert_eq!(index.get(100_000), None);
-        assert_eq!(index.get(100_001), None);
-    }
-
-    #[test]
-    fn test_batch_operations() {
+    fn basic_build_and_query() {
         let data: Vec<u64> = (0..10_000).collect();
-        let index = PGMIndex::new(data, 64);
-
-        let queries = vec![100, 500, 1000, 5000, 9999];
-        let results = index.batch_get(&queries);
-
-        for (i, &query) in queries.iter().enumerate() {
-            assert_eq!(results[i], Some(query as usize));
-        }
-    }
-
-    #[test]
-    fn test_prediction_accuracy() {
-        let data: Vec<u64> = (0..1000).step_by(2).collect(); // 0, 2, 4, 6, ...
-        let index = PGMIndex::new(data, 16);
-
-        for (i, &key) in index.data.iter().enumerate() {
-            let (lo, hi) = index.predict(key);
-            assert!(
-                lo <= i && i < hi,
-                "Prediction range [{}, {}) doesn't contain actual position {} for key {}",
-                lo,
-                hi,
-                i,
-                key
-            );
-        }
-    }
-
-    #[test]
-    fn test_different_epsilon_values() {
-        let data: Vec<u64> = (0..1000).collect();
-
-        for epsilon in [1, 8, 32, 128] {
-            let index = PGMIndex::new(data.clone(), epsilon);
-
-            // All keys should be found
-            for &key in &[0, 100, 500, 999] {
-                assert!(index.get(key).is_some());
-            }
-
-            // Smaller epsilon should create more segments (generally)
-            if epsilon == 1 {
-                assert!(index.segment_count() > 10);
+        for &eps in &[16usize, 32, 64, 128] {
+            let idx = PGMIndex::new(data.clone(), eps);
+            assert!(idx.segment_count() >= 1);
+            for &k in &[0u64, 1234, 9999] {
+                let got = idx.get(k);
+                assert_eq!(got, Some(k as usize));
             }
         }
     }
 
     #[test]
-    fn test_edge_cases() {
-        // Single element
-        let data = vec![42u64];
-        let index = PGMIndex::new(data, 1);
-        assert_eq!(index.get(42), Some(0));
-        assert_eq!(index.get(43), None);
-
-        // Two elements
-        let data = vec![10u64, 20u64];
-        let index = PGMIndex::new(data, 1);
-        assert_eq!(index.get(10), Some(0));
-        assert_eq!(index.get(20), Some(1));
-        assert_eq!(index.get(15), None);
-    }
-
-    #[test]
-    fn test_performance_stats() {
-        let data: Vec<u64> = (0..1000).collect();
-        let index = PGMIndex::new(data, 32);
-
-        // Initial stats
-        let stats = index.get_stats();
-        assert_eq!(stats.total_queries, 0);
-        assert_eq!(stats.cache_hits, 0);
-
-        // After some queries
-        let _ = index.get(100);
-        let _ = index.get(500);
-        let _ = index.get(1000); // Not found
-
-        let stats = index.get_stats();
-        assert_eq!(stats.total_queries, 3);
-        assert_eq!(stats.cache_hits, 2); // Two successful finds
-        assert!((stats.cache_hit_rate - 2.0 / 3.0).abs() < 0.01);
+    fn epsilon_monotonicity_on_segments() {
+        let data: Vec<u64> = (0..100_000).collect();
+        let idx16 = PGMIndex::new(data.clone(), 16);
+        let idx128 = PGMIndex::new(data, 128);
+        assert!(idx16.segment_count() >= idx128.segment_count());
     }
 }

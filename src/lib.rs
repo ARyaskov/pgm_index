@@ -49,7 +49,7 @@
 pub mod pgm_index;
 
 // Re-export main types
-pub use pgm_index::{Key, PGMIndex, PGMStats, Segment};
+pub use pgm_index::{Key, PGMIndex, Segment};
 
 #[cfg(test)]
 mod tests {
