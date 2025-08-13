@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgm_index = "0.1"
+pgm_index = "0.3"
 ````
 
 ---
