@@ -1,0 +1,6 @@
+# Create GitHub Releases with tag "v<version>" when releasing.
+[git_release]
+enable = true
+tag_prefix = "v"
+
+[changelog]
