@@ -28,6 +28,16 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
+      - name: Attach HEAD to default branch (fix detached HEAD for release-plz)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch || 'main' }}"
+          git fetch origin "${DEFAULT_BRANCH}:${DEFAULT_BRANCH}"
+          git checkout -B "${DEFAULT_BRANCH}" "${GITHUB_SHA}"
+          git branch --set-upstream-to="origin/${DEFAULT_BRANCH}" "${DEFAULT_BRANCH}"
+          git status --branch --short
+
       - name: release-plz (release)
         uses: release-plz/action@v0.5
         with:
@@ -40,5 +50,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
