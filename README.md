@@ -99,6 +99,12 @@ Using **ε = 32** as a balanced configuration:
 
 ---
 
+## In case you want a single-threaded environment
+
+There is a more optimized for single-threaded execution implementation of the PGM algo by @i18nsite [https://crates.io/crates/jdb_pgm](https://crates.io/crates/jdb_pgm) https://github.com/ARyaskov/pgm_index/issues/2
+
+---
+
 ## 📜 License
 
 MIT
