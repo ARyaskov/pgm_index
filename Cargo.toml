@@ -1,6 +1,6 @@
 [package]
 name = "pgm_index"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Ultra-fast learned PGM-Index for efficient sorted key lookup with bounded error"
 license = "MIT"
@@ -32,6 +32,8 @@ rand = "0.8"
 [features]
 default = []
 jemalloc = ["dep:jemallocator"]
+metrics = []
+serde = []
 
 [[example]]
 name = "simple_benchmark"

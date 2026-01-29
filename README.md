@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgm_index = "*"
+pgm_index = ">=0.3.4"
 ````
 
 ---
@@ -60,6 +60,22 @@ CPU: Intel Core i7 12700, Windows 11, single-threaded
 
 **Binary Search (baseline)**:
 4.32 ms, 23.13 M/s, 43.2 ns/query.
+
+---
+
+## 🍎 Apple M1 Benchmark (PGM-Index Simple Benchmark)
+
+Dataset: **100,000,000 elements**, 100,000 random queries  
+CPU: Apple M1 (8 threads), macOS
+
+```
+  eps | build ms |     segs |    avg_seg |   mem MB |    over% |  single ns |   batch ns |     par ns |    hits |   phits |    edge ns | win_hit |      fb |  win_probe
+------+----------+----------+------------+----------+----------+------------+------------+------------+---------+---------+------------+---------+---------+-----------
+   16 |     1942 |    49122 |     2035.7 |   767.06 |     0.54 |     1579.1 |      904.1 |       57.8 |  100000 |  100000 |       1417 |       0 |       0 |          0
+   32 |     2539 |    12484 |     8010.3 |   763.99 |     0.14 |      795.9 |      559.7 |       40.2 |  100000 |  100000 |        708 |       0 |       0 |          0
+   64 |     1453 |     3191 |    31338.1 |   763.21 |     0.04 |     1600.0 |     1841.9 |       56.8 |  100000 |  100000 |       1542 |       0 |       0 |          0
+  128 |     1466 |      811 |   123304.6 |   763.01 |     0.01 |      945.9 |      643.7 |       60.7 |  100000 |  100000 |       1000 |       0 |       0 |          0
+```
 
 ---
 
@@ -108,4 +124,3 @@ There is a more optimized for single-threaded execution implementation of the PG
 ## 📜 License
 
 MIT
-
